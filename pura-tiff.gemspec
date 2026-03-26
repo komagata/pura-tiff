@@ -15,7 +15,7 @@ Gem::Specification.new do |spec|
 
   spec.files = Dir["lib/**/*.rb", "bin/*", "LICENSE", "README.md"]
   spec.bindir = "bin"
-  spec.executables = ["pure-tiff"]
+  spec.executables = ["pura-tiff"]
 
   spec.add_development_dependency "minitest", "~> 5.0"
   spec.add_development_dependency "rake", "~> 13.0"
