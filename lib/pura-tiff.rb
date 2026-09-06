@@ -7,8 +7,8 @@ require_relative "pura/tiff/encoder"
 
 module Pura
   module Tiff
-    def self.decode(input)
-      Decoder.decode(input)
+    def self.decode(input, **options)
+      Decoder.decode(input, **options)
     end
 
     def self.encode(image, output_path)
