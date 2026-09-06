@@ -3,6 +3,7 @@
 module Pura
   module Tiff
     class DecodeError < StandardError; end
+    class LimitExceeded < DecodeError; end
 
     class Decoder
       # TIFF tag IDs
@@ -48,16 +49,32 @@ module Pura
         TYPE_RATIONAL => 8
       }.freeze
 
-      def self.decode(input)
+      DEFAULT_MAX_INPUT_BYTES = 64 * 1024 * 1024
+      DEFAULT_MAX_PIXELS = 40_000_000
+      DEFAULT_MAX_DECODED_BYTES = 256 * 1024 * 1024
+
+      def self.decode(input, max_input_bytes: DEFAULT_MAX_INPUT_BYTES, **options)
+        unless max_input_bytes.is_a?(Integer) && max_input_bytes.positive?
+          raise ArgumentError, "max_input_bytes must be a positive integer"
+        end
+
         data = if input.is_a?(String) && input.bytesize < 4096 && !input.include?("\0") && File.exist?(input)
-                 File.binread(input)
+                 File.binread(input, max_input_bytes + 1)
                else
                  input.b
                end
-        new(data).decode
+        raise LimitExceeded, "TIFF input limit exceeded" if data.bytesize > max_input_bytes
+
+        new(data, **options).decode
       end
 
-      def initialize(data)
+      def initialize(data, max_pixels: DEFAULT_MAX_PIXELS, max_decoded_bytes: DEFAULT_MAX_DECODED_BYTES)
+        unless [max_pixels, max_decoded_bytes].all? { |value| value.is_a?(Integer) && value.positive? }
+          raise ArgumentError, "decode limits must be positive integers"
+        end
+
+        @max_pixels = max_pixels
+        @max_decoded_bytes = max_decoded_bytes
         @data = data
         @pos = 0
         @little = true
@@ -88,22 +105,36 @@ module Pura
           raise DecodeError, "unsupported compression: #{compression}"
         end
 
-        # Decompress all strips
+        raise DecodeError, "invalid TIFF dimensions" unless width.positive? && height.positive?
+        raise LimitExceeded, "TIFF pixel limit exceeded" if width * height > @max_pixels
+        raise DecodeError, "invalid SamplesPerPixel" unless samples_per_pixel.positive?
+
+        expected = width * height * samples_per_pixel
+        if [expected, width * height * 3].max > @max_decoded_bytes
+          raise LimitExceeded, "TIFF decoded byte limit exceeded"
+        end
+        unless strip_offsets.size == strip_byte_counts.size
+          raise DecodeError, "strip offsets and byte counts must have equal sizes"
+        end
+
+        # Decompress all strips, bounding every append before allocating output.
         raw = String.new(encoding: Encoding::BINARY)
         strip_offsets.each_with_index do |offset, i|
           count = strip_byte_counts[i]
           strip_data = @data.byteslice(offset, count)
           raise DecodeError, "truncated strip data" unless strip_data && strip_data.bytesize == count
 
-          case compression
-          when COMPRESSION_NONE
-            raw << strip_data
-          when COMPRESSION_LZW
-            raw << decompress_lzw(strip_data)
-          when COMPRESSION_PACKBITS
-            raw << decompress_packbits(strip_data)
-          end
+          remaining = expected - raw.bytesize
+          decoded = case compression
+                    when COMPRESSION_NONE then strip_data
+                    when COMPRESSION_LZW then decompress_lzw(strip_data, remaining)
+                    when COMPRESSION_PACKBITS then decompress_packbits(strip_data, remaining)
+                    end
+          raise DecodeError, "excess TIFF strip data size" if decoded.bytesize > remaining
+
+          raw << decoded
         end
+        raise DecodeError, "incorrect TIFF strip data size" unless raw.bytesize == expected
 
         # Convert to RGB
         pixels = convert_to_rgb(raw, width, height, photometric, samples_per_pixel, color_map, extra_samples)
@@ -133,6 +164,7 @@ module Pura
 
       def parse_ifd(offset)
         count = read_u16(offset)
+        check_bounds(offset + 2, (count * 12) + 4)
         tags = {}
 
         count.times do |i|
@@ -151,6 +183,7 @@ module Pura
                           read_u32(value_offset_field)
                         end
 
+          check_bounds(data_offset, total_size)
           tags[tag_id] = { type: type, count: value_count, offset: data_offset }
         end
 
@@ -191,7 +224,14 @@ module Pura
         end
       end
 
+      def check_bounds(offset, size)
+        return if offset >= 0 && size >= 0 && offset + size <= @data.bytesize
+
+        raise DecodeError, "TIFF data out of bounds or truncated"
+      end
+
       def read_u16(offset)
+        check_bounds(offset, 2)
         if @little
           @data.getbyte(offset) | (@data.getbyte(offset + 1) << 8)
         else
@@ -200,6 +240,7 @@ module Pura
       end
 
       def read_u32(offset)
+        check_bounds(offset, 4)
         if @little
           @data.getbyte(offset) |
             (@data.getbyte(offset + 1) << 8) |
@@ -283,7 +324,7 @@ module Pura
         out
       end
 
-      def decompress_lzw(data)
+      def decompress_lzw(data, limit)
         # TIFF LZW uses big-endian bit packing (MSB first)
         out = String.new(encoding: Encoding::BINARY)
         bit_buf = 0
@@ -335,6 +376,8 @@ module Pura
             raise DecodeError, "invalid LZW code: #{code} (next=#{next_code})"
           end
 
+          raise DecodeError, "excess TIFF strip data size" if out.bytesize + current.bytesize > limit
+
           out << current
 
           if prev_string && (next_code < 4096)
@@ -353,7 +396,7 @@ module Pura
         out
       end
 
-      def decompress_packbits(data)
+      def decompress_packbits(data, limit)
         out = String.new(encoding: Encoding::BINARY)
         pos = 0
         size = data.bytesize
@@ -365,11 +408,17 @@ module Pura
           if n < 128
             # Copy next n+1 bytes literally
             count = n + 1
+            raise DecodeError, "truncated PackBits literal" if pos + count > size
+            raise DecodeError, "excess TIFF strip data size" if out.bytesize + count > limit
+
             out << data.byteslice(pos, count)
             pos += count
           elsif n > 128
             # Repeat next byte (257-n) times
             count = 257 - n
+            raise DecodeError, "truncated PackBits repeat" if pos >= size
+            raise DecodeError, "excess TIFF strip data size" if out.bytesize + count > limit
+
             byte = data.byteslice(pos, 1)
             pos += 1
             out << (byte * count)
